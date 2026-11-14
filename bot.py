@@ -12,6 +12,7 @@ Python 3.10+
 - 봇 초대 권한:
   View Channels, Send Messages, Embed Links, Read Message History,
   Manage Messages, Moderate Members, Kick Members, Ban Members, View Audit Log
+- 서버 관리 권한(Manage Server): /들낙 켜기·끄기, /도배 켜기·끄기
 - 봇 역할을 관리 대상 유저의 역할보다 위에 배치해야 합니다.
 
 명령어는 서버별로 시작 시 동기화되므로 이미 봇이 있는 서버에도 반영됩니다.
@@ -70,6 +71,13 @@ def init_database() -> None:
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
+        # 도배 감지 설정: 기존 동작을 유지하도록 설정이 없는 서버는 기본 활성화
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS spam_guard_settings (
+                guild_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sanctions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +128,26 @@ def set_leave_guard(guild_id: int, enabled: bool) -> None:
         )
         if not enabled:
             conn.execute("DELETE FROM leave_guard_joins WHERE guild_id = ?", (guild_id,))
+        conn.commit()
+
+
+def spam_guard_enabled(guild_id: int) -> bool:
+    """설정이 아직 없는 서버는 기존 동작을 유지하도록 기본 활성화한다."""
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            "SELECT enabled FROM spam_guard_settings WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()
+    return True if row is None else bool(row[0])
+
+
+def set_spam_guard(guild_id: int, enabled: bool) -> None:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute(
+            "INSERT INTO spam_guard_settings (guild_id, enabled) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET enabled=excluded.enabled",
+            (guild_id, int(enabled)),
+        )
         conn.commit()
 
 
@@ -395,6 +423,39 @@ async def leave_guard_off(interaction: discord.Interaction):
 
 
 bot.tree.add_command(leave_guard_group)
+
+
+spam_guard_group = app_commands.Group(
+    name="도배",
+    description="동일한 텍스트 및 이미지의 반복 발송 감지를 설정합니다.",
+)
+
+
+@spam_guard_group.command(name="켜기", description="이 서버의 자동 도배 감지를 켭니다.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def spam_guard_on(interaction: discord.Interaction):
+    set_spam_guard(interaction.guild_id, True)
+    await interaction.response.send_message(
+        f"이 서버의 도배 감지를 켰습니다. {SPAM_WINDOW_SECONDS // 60}분 이내 동일한 텍스트 또는 이미지가 {SPAM_LIMIT}회 연속 발송되면 {TIMEOUT_MINUTES}분 타임아웃이 적용됩니다.",
+        ephemeral=True,
+    )
+
+
+@spam_guard_group.command(name="끄기", description="이 서버의 자동 도배 감지를 끕니다.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def spam_guard_off(interaction: discord.Interaction):
+    set_spam_guard(interaction.guild_id, False)
+    # 껐다가 다시 켰을 때 이전 메시지 기록이 이어지지 않도록 해당 서버의 감지 상태 제거
+    for key in list(spam_states):
+        if key[0] == interaction.guild_id:
+            spam_states.pop(key, None)
+    await interaction.response.send_message(
+        "이 서버의 도배 감지를 껐습니다. 다시 켜기 전까지 자동 도배 제재가 적용되지 않습니다.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(spam_guard_group)
 
 
 # -------------------- /경고 /주의 --------------------
@@ -935,6 +996,11 @@ async def on_message(message: discord.Message):
 
     member = message.author
     if not isinstance(member, discord.Member):
+        return
+
+    # 서버별 도배 감지가 꺼져 있으면 감지 및 자동 제재를 건너뜀
+    if not spam_guard_enabled(message.guild.id):
+        await bot.process_commands(message)
         return
 
     # 관리자/메시지 관리 권한자는 자동 도배 제재에서 제외

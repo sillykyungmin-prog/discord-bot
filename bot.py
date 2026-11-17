@@ -342,16 +342,27 @@ def get_room(guild_id: int, channel_id: int):
 
 
 def get_user_rooms(guild_id: int, user_id: int) -> list[tuple[int, str, bool]]:
+    # LEFT JOIN can return the same room more than once if the membership
+    # table contains duplicate rows. Discord select option values must be unique.
     with sqlite3.connect(DATABASE_PATH) as conn:
         rows = conn.execute(
-            "SELECT r.channel_id, r.room_name, r.owner_id "
+            "SELECT DISTINCT r.channel_id, r.room_name, r.owner_id, r.created_at "
             "FROM private_rooms r LEFT JOIN private_room_members m "
             "ON r.guild_id=m.guild_id AND r.channel_id=m.channel_id "
             "WHERE r.guild_id=? AND (r.owner_id=? OR m.user_id=?) "
             "ORDER BY r.created_at DESC",
             (guild_id, user_id, user_id),
         ).fetchall()
-    return [(int(channel_id), name, int(owner_id) == user_id) for channel_id, name, owner_id in rows]
+
+    # Deduplicate by channel ID as a second safeguard, preserving newest-first order.
+    unique_rooms = {}
+    for channel_id, name, owner_id, _created_at in rows:
+        channel_id = int(channel_id)
+        unique_rooms.setdefault(
+            channel_id,
+            (channel_id, name, int(owner_id) == user_id),
+        )
+    return list(unique_rooms.values())
 
 
 def get_room_members(guild_id: int, channel_id: int) -> list[int]:

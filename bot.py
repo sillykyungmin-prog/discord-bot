@@ -11,24 +11,26 @@ Python 3.10+
   PRESENCE INTENT (유저정보의 온라인 상태/활동 조회용)
 - 봇 초대 권한:
   View Channels, Send Messages, Embed Links, Read Message History,
-  Manage Messages, Moderate Members, Kick Members, Ban Members, View Audit Log
-- 서버 관리 권한(Manage Server): /들낙 켜기·끄기, /도배 켜기·끄기
+  Manage Messages, Moderate Members, Kick Members, Ban Members, View Audit Log,
+  Manage Channels, Manage Roles (개인 채팅방 생성 및 권한 설정용)
+- 서버 관리 권한(Manage Server): /들낙, /도배, /알림채널, /채팅 패널설정 및 기존 설정 명령어
 - 봇 역할을 관리 대상 유저의 역할보다 위에 배치해야 합니다.
 
 명령어는 서버별로 시작 시 동기화되므로 이미 봇이 있는 서버에도 반영됩니다.
 코드를 추가/수정한 뒤에는 파일을 저장하고 봇을 재시작해야 합니다.
 
 참고:
-Discord API는 온보딩 화면에서 사용자가 고른 임의의 "공지 채널" 값을
-별도 필드로 항상 제공하지 않습니다. 이 코드는 커뮤니티 서버의
-공개 업데이트 채널(public_updates_channel)을 먼저 찾고, 없으면
-시스템 채널(system_channel)을 사용합니다.
+- /공지 명령어는 공지 채널 유형으로 설정된 모든 텍스트 채널에 발송합니다.
+- 공지 채널 유형 채널이 없을 때 공개 업데이트 채널 및 시스템 채널을 보조로 사용합니다.
+- 개인 채팅방은 SQLite에 저장되며, Railway에서는 /data 볼륨 사용을 권장합니다.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import json
+import asyncio
 import hashlib
 import logging
 import sqlite3
@@ -105,8 +107,43 @@ def init_database() -> None:
                 automatic INTEGER NOT NULL DEFAULT 0
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS moderation_alert_channels (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_panel_settings (
+                guild_id INTEGER PRIMARY KEY,
+                panel_channel_id INTEGER NOT NULL,
+                category_id INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS private_rooms (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                room_name TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (guild_id, channel_id),
+                UNIQUE (guild_id, owner_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS private_room_members (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                joined_at REAL NOT NULL,
+                PRIMARY KEY (guild_id, channel_id, user_id)
+            )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sanctions_user ON sanctions(guild_id, user_id, active, kind)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON moderation_history(guild_id, user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_private_room_owner ON private_rooms(guild_id, owner_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_private_room_members_user ON private_room_members(guild_id, user_id)")
         conn.commit()
 
 
@@ -179,89 +216,123 @@ def clear_member_join(guild_id: int, user_id: int) -> None:
         conn.commit()
 
 
-# -------------------- 제재 기록 / 경고·주의 시스템 --------------------
+# -------------------- 공개 제재 알림 채널 / 개인 채팅방 저장소 --------------------
 
-WARNING_LIMIT = 5
-CAUTION_LIMIT = 2
-CAUTION_EXPIRY_SECONDS = 7 * 24 * 60 * 60
-
-
-def db_counts(guild_id: int, user_id: int) -> tuple[int, int]:
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        rows = conn.execute(
-            "SELECT kind, COUNT(*) FROM sanctions WHERE guild_id=? AND user_id=? AND active=1 GROUP BY kind",
-            (guild_id, user_id),
-        ).fetchall()
-    counts = {kind: count for kind, count in rows}
-    return counts.get("warning", 0), counts.get("caution", 0)
-
-
-def add_history(guild_id: int, user_id: int, action: str, reason: str, actor_id: int | None, automatic: bool = False) -> None:
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        conn.execute(
-            "INSERT INTO moderation_history (guild_id,user_id,action,reason,actor_id,created_at,automatic) VALUES (?,?,?,?,?,?,?)",
-            (guild_id, user_id, action, reason[:1000], actor_id, datetime.now(timezone.utc).timestamp(), int(automatic)),
-        )
-        conn.commit()
-
-
-def add_sanction(guild_id: int, user_id: int, kind: str, actor_id: int | None, reason: str) -> None:
-    now = datetime.now(timezone.utc).timestamp()
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        conn.execute(
-            "INSERT INTO sanctions (guild_id,user_id,kind,active,created_at,actor_id,reason) VALUES (?,?,?,1,?,?,?)",
-            (guild_id, user_id, kind, now, actor_id, reason[:1000]),
-        )
-        conn.commit()
-    add_history(guild_id, user_id, "경고 부여" if kind == "warning" else "주의 부여", reason, actor_id)
-
-
-def remove_sanction(guild_id: int, user_id: int, kind: str, actor_id: int | None, reason: str) -> bool:
-    now = datetime.now(timezone.utc).timestamp()
+def get_moderation_alert_channel(guild_id: int) -> int | None:
     with sqlite3.connect(DATABASE_PATH) as conn:
         row = conn.execute(
-            "SELECT id FROM sanctions WHERE guild_id=? AND user_id=? AND kind=? AND active=1 ORDER BY created_at ASC, id ASC LIMIT 1",
-            (guild_id, user_id, kind),
+            "SELECT channel_id FROM moderation_alert_channels WHERE guild_id=?", (guild_id,)
         ).fetchone()
-        if not row:
-            return False
-        conn.execute("UPDATE sanctions SET active=0, removed_at=? WHERE id=?", (now, row[0]))
+    return int(row[0]) if row else None
+
+
+def set_moderation_alert_channel(guild_id: int, channel_id: int | None) -> None:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        if channel_id is None:
+            conn.execute("DELETE FROM moderation_alert_channels WHERE guild_id=?", (guild_id,))
+        else:
+            conn.execute(
+                "INSERT INTO moderation_alert_channels(guild_id,channel_id) VALUES(?,?) "
+                "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id",
+                (guild_id, channel_id),
+            )
         conn.commit()
-    add_history(guild_id, user_id, "경고 차감" if kind == "warning" else "주의 차감", reason, actor_id)
-    return True
 
 
-async def get_actor_label(guild: discord.Guild, actor_id: int | None) -> str:
-    if actor_id is None:
-        return "자동 시스템"
-    member = guild.get_member(actor_id)
-    if member:
-        return f"{member} ({member.id})"
-    try:
-        user = await bot.fetch_user(actor_id)
-        return f"{user} ({user.id})"
-    except discord.HTTPException:
-        return f"알 수 없는 관리자 ({actor_id})"
+def get_chat_panel_settings(guild_id: int) -> tuple[int, int | None] | None:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            "SELECT panel_channel_id, category_id FROM chat_panel_settings WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+    return (int(row[0]), int(row[1]) if row[1] is not None else None) if row else None
+
+
+def set_chat_panel_settings(guild_id: int, panel_channel_id: int, category_id: int | None = None) -> None:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute(
+            "INSERT INTO chat_panel_settings(guild_id,panel_channel_id,category_id) VALUES(?,?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET panel_channel_id=excluded.panel_channel_id, category_id=excluded.category_id",
+            (guild_id, panel_channel_id, category_id),
+        )
+        conn.commit()
+
+
+def get_owned_room(guild_id: int, user_id: int):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        return conn.execute(
+            "SELECT channel_id, room_name FROM private_rooms WHERE guild_id=? AND owner_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+
+
+def get_room(guild_id: int, channel_id: int):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        return conn.execute(
+            "SELECT owner_id, room_name FROM private_rooms WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id),
+        ).fetchone()
+
+
+def get_user_rooms(guild_id: int, user_id: int) -> list[tuple[int, str, bool]]:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute(
+            "SELECT r.channel_id, r.room_name, r.owner_id "
+            "FROM private_rooms r LEFT JOIN private_room_members m "
+            "ON r.guild_id=m.guild_id AND r.channel_id=m.channel_id "
+            "WHERE r.guild_id=? AND (r.owner_id=? OR m.user_id=?) "
+            "ORDER BY r.created_at DESC",
+            (guild_id, user_id, user_id),
+        ).fetchall()
+    return [(int(channel_id), name, int(owner_id) == user_id) for channel_id, name, owner_id in rows]
+
+
+def get_room_members(guild_id: int, channel_id: int) -> list[int]:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM private_room_members WHERE guild_id=? AND channel_id=? ORDER BY joined_at",
+            (guild_id, channel_id),
+        ).fetchall()
+    return [int(row[0]) for row in rows]
 
 
 async def send_action_dm(
     user: discord.abc.User, guild: discord.Guild, action: str, reason: str,
     actor_id: int | None, warning_count: int | None = None, caution_count: int | None = None,
 ) -> bool:
+    """대상자 DM과 서버 공개 제재 알림 채널에 각각 독립적으로 전송한다."""
     if warning_count is None or caution_count is None:
         warning_count, caution_count = db_counts(guild.id, user.id)
     actor_label = await get_actor_label(guild, actor_id)
-    embed = make_embed("서버 관리 안내", f"**{guild.name}** 서버에서 관리 조치가 적용되었습니다.", discord.Color.orange())
+    mention_text = f"<@{user.id}>"
+    embed = make_embed("서버 관리 안내", f"**{guild.name}** 서버에서 관리 조치가 적용되었습니다.\n대상: {mention_text}", discord.Color.orange())
     embed.add_field(name="조치 내용", value=action[:1024], inline=False)
     embed.add_field(name="조치 사유", value=(reason or "사유가 입력되지 않았습니다.")[:1024], inline=False)
     embed.add_field(name="조치한 관리자", value=actor_label[:1024], inline=False)
     embed.add_field(name="현재 경고 / 주의", value=f"경고 **{warning_count}/{WARNING_LIMIT}개** · 주의 **{caution_count}/{CAUTION_LIMIT}개**", inline=False)
+
+    dm_sent = False
     try:
-        await user.send(embed=embed)
-        return True
+        await user.send(content=mention_text, embed=embed)
+        dm_sent = True
     except (discord.Forbidden, discord.HTTPException):
-        log.info("DM 전송 실패 또는 차단: guild=%s user=%s action=%s", guild.id, user.id, action)
-        return False
+        log.info("DM 제재 알림 전송 실패: guild=%s user=%s action=%s", guild.id, user.id, action)
+
+    alert_channel_id = get_moderation_alert_channel(guild.id)
+    if alert_channel_id:
+        channel = guild.get_channel(alert_channel_id)
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send(
+                    content=mention_text,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                log.exception("공개 제재 알림 채널 전송 실패: guild=%s channel=%s user=%s", guild.id, alert_channel_id, user.id)
+        else:
+            log.warning("설정된 제재 알림 채널을 찾을 수 없거나 텍스트 채널이 아닙니다: guild=%s channel=%s", guild.id, alert_channel_id)
+    return dm_sent
 
 
 async def apply_warning_threshold(guild: discord.Guild, user: discord.abc.User, actor_id: int | None, reason: str) -> bool:
@@ -631,6 +702,546 @@ async def send_command_error(interaction: discord.Interaction, message: str) -> 
         await interaction.response.send_message(message, ephemeral=True)
 
 
+# -------------------- 공개 제재 알림 채널 설정 --------------------
+
+@bot.tree.command(name="알림채널", description="제재 알림을 공개할 서버 채널을 설정합니다.")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(채널="제재 내용을 공개할 텍스트 채널")
+async def moderation_alert_channel_command(interaction: discord.Interaction, 채널: discord.TextChannel):
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+    me = guild.me
+    bot_perms = 채널.permissions_for(me) if me else None
+    public_perms = 채널.permissions_for(guild.default_role)
+    if not public_perms.view_channel:
+        return await interaction.response.send_message("모든 서버 멤버가 볼 수 있는 공개 텍스트 채널을 선택해주세요.", ephemeral=True)
+    if not bot_perms or not bot_perms.send_messages or not bot_perms.embed_links:
+        return await interaction.response.send_message("봇에게 해당 채널의 메시지 전송 및 임베드 링크 권한이 필요합니다.", ephemeral=True)
+    set_moderation_alert_channel(guild.id, 채널.id)
+    await interaction.response.send_message(
+        f"제재 알림 채널을 {채널.mention}(으)로 설정했습니다. 이후 제재 내용은 DM과 이 채널에 각각 전송됩니다.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="알림채널해제", description="공개 제재 알림 채널 설정을 해제합니다.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def moderation_alert_channel_clear_command(interaction: discord.Interaction):
+    set_moderation_alert_channel(interaction.guild_id, None)
+    await interaction.response.send_message("공개 제재 알림 채널 설정을 해제했습니다.", ephemeral=True)
+
+
+# -------------------- 개인 채팅방 시스템 --------------------
+
+room_creation_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def room_channel_name(name: str) -> str:
+    value = re.sub(r"[^0-9a-z가-힣_-]+", "-", name.strip().lower()).strip("-")
+    return (value or "private-room")[:90]
+
+
+async def get_or_create_room_category(guild: discord.Guild) -> discord.CategoryChannel:
+    settings = get_chat_panel_settings(guild.id)
+    if settings and settings[1]:
+        category = guild.get_channel(settings[1])
+        if isinstance(category, discord.CategoryChannel):
+            return category
+    panel_channel = guild.get_channel(settings[0]) if settings else None
+    if isinstance(panel_channel, discord.TextChannel) and panel_channel.category:
+        category = panel_channel.category
+    else:
+        me = guild.me
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        }
+        if me:
+            overwrites[me] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                manage_channels=True, manage_roles=True, manage_messages=True,
+            )
+        category = await guild.create_category("개인 채팅방", overwrites=overwrites, reason="개인 채팅방 시스템")
+    set_chat_panel_settings(guild.id, settings[0] if settings else (panel_channel.id if panel_channel else 0), category.id)
+    return category
+
+
+async def create_private_room(guild: discord.Guild, owner: discord.Member, room_name: str) -> discord.TextChannel:
+    key = (guild.id, owner.id)
+    lock = room_creation_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        if get_owned_room(guild.id, owner.id):
+            raise ValueError("이미 소유한 채팅방이 있습니다. 기존 채팅방을 삭제하거나 소유권을 양도한 뒤 다시 시도해주세요.")
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_channels or not me.guild_permissions.manage_roles:
+            raise ValueError("봇에게 채널 관리 및 권한 관리 권한이 필요합니다.")
+        category = await get_or_create_room_category(guild)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                manage_channels=True, manage_roles=True, manage_messages=True,
+            ),
+            owner: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        channel = await guild.create_text_channel(
+            name=room_channel_name(room_name),
+            category=category,
+            overwrites=overwrites,
+            topic=f"비공개 개인 채팅방 | 소유자 ID: {owner.id}",
+            reason=f"개인 채팅방 생성: {owner} ({owner.id})",
+        )
+        try:
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                conn.execute(
+                    "INSERT INTO private_rooms(guild_id,channel_id,owner_id,room_name,created_at) VALUES(?,?,?,?,?)",
+                    (guild.id, channel.id, owner.id, room_name[:100], datetime.now(timezone.utc).timestamp()),
+                )
+                conn.commit()
+        except Exception:
+            await channel.delete(reason="개인 채팅방 데이터 저장 실패로 인한 정리")
+            raise
+        return channel
+
+
+async def delete_private_room(guild: discord.Guild, channel_id: int, reason: str) -> None:
+    channel = guild.get_channel(channel_id)
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.delete(reason=reason)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            log.exception("개인 채팅방 채널 삭제 실패: guild=%s channel=%s", guild.id, channel_id)
+            raise
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("DELETE FROM private_room_members WHERE guild_id=? AND channel_id=?", (guild.id, channel_id))
+        conn.execute("DELETE FROM private_rooms WHERE guild_id=? AND channel_id=?", (guild.id, channel_id))
+        conn.commit()
+
+
+async def remove_room_member(guild: discord.Guild, channel_id: int, user_id: int) -> None:
+    channel = guild.get_channel(channel_id)
+    member = guild.get_member(user_id)
+    if isinstance(channel, discord.TextChannel) and member:
+        await channel.set_permissions(member, overwrite=None, reason="개인 채팅방 참여 종료")
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute(
+            "DELETE FROM private_room_members WHERE guild_id=? AND channel_id=? AND user_id=?",
+            (guild.id, channel_id, user_id),
+        )
+        conn.commit()
+
+
+async def cleanup_member_private_rooms(guild: discord.Guild, user_id: int) -> None:
+    """서버를 떠난 소유자의 방은 삭제하고, 초대 참여 기록은 제거한다."""
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        owned = conn.execute(
+            "SELECT channel_id FROM private_rooms WHERE guild_id=? AND owner_id=?", (guild.id, user_id)
+        ).fetchall()
+        joined = conn.execute(
+            "SELECT channel_id FROM private_room_members WHERE guild_id=? AND user_id=?", (guild.id, user_id)
+        ).fetchall()
+    for (channel_id,) in owned:
+        try:
+            await delete_private_room(guild, int(channel_id), "채팅방 소유자가 서버를 나가거나 추방되어 자동 삭제")
+        except discord.HTTPException:
+            log.exception("소유자 퇴장에 따른 채팅방 정리 실패: guild=%s channel=%s", guild.id, channel_id)
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("DELETE FROM private_room_members WHERE guild_id=? AND user_id=?", (guild.id, user_id))
+        conn.commit()
+    # 초대받은 유저가 나간 경우에도 오래된 참여 기록을 남기지 않는다.
+    for (channel_id,) in joined:
+        channel = guild.get_channel(int(channel_id))
+        if isinstance(channel, discord.TextChannel):
+            try:
+                # 퇴장한 멤버의 개별 권한 덮어쓰기도 제거해 재가입 후 접근이 남지 않게 한다.
+                await channel.set_permissions(discord.Object(id=user_id), overwrite=None)
+            except discord.HTTPException:
+                log.exception("퇴장 멤버의 개인 채팅방 권한 제거 실패: guild=%s channel=%s user=%s", guild.id, channel_id, user_id)
+
+
+class CreatePrivateRoomModal(discord.ui.Modal, title="개인 채팅방 만들기"):
+    room_name = discord.ui.TextInput(label="채팅방 이름", placeholder="예: 게임 이야기", min_length=1, max_length=90)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            channel = await create_private_room(interaction.guild, interaction.user, str(self.room_name.value))
+            await interaction.followup.send(f"개인 채팅방을 만들었습니다: {channel.mention}", ephemeral=True)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("봇에게 채널 생성 또는 권한 설정 권한이 없습니다.", ephemeral=True)
+        except discord.HTTPException:
+            log.exception("개인 채팅방 생성 실패")
+            await interaction.followup.send("채팅방을 생성하지 못했습니다. 봇 권한과 카테고리 설정을 확인해주세요.", ephemeral=True)
+        except sqlite3.IntegrityError:
+            await interaction.followup.send("이미 소유한 채팅방이 확인되었습니다. 내 채팅방 목록을 새로고침해주세요.", ephemeral=True)
+
+
+class ChatPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="채팅방 만들기", style=discord.ButtonStyle.primary, emoji="➕", custom_id="private_chat:create")
+    async def create_room(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+        if get_owned_room(interaction.guild.id, interaction.user.id):
+            return await interaction.response.send_message("이미 소유한 채팅방이 있습니다. 먼저 기존 채팅방을 삭제하거나 소유권을 양도해주세요.", ephemeral=True)
+        await interaction.response.send_modal(CreatePrivateRoomModal())
+
+    @discord.ui.button(label="내 채팅방", style=discord.ButtonStyle.secondary, emoji="📂", custom_id="private_chat:my_rooms")
+    async def my_rooms(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+        rooms = get_user_rooms(interaction.guild.id, interaction.user.id)
+        if not rooms:
+            return await interaction.response.send_message("현재 참여 중인 채팅방이 없습니다.", ephemeral=True)
+        await interaction.response.send_message(
+            "확인하거나 관리할 채팅방을 선택하세요.",
+            view=MyPrivateRoomsView(interaction.guild, interaction.user.id, rooms),
+            ephemeral=True,
+        )
+
+
+class MyPrivateRoomsSelect(discord.ui.Select):
+    def __init__(self, guild: discord.Guild, user_id: int, rooms: list[tuple[int, str, bool]]):
+        self.guild = guild
+        self.user_id = user_id
+        options = [
+            discord.SelectOption(
+                label=(name[:100] or "이름 없는 채팅방"),
+                value=str(channel_id),
+                description="소유자" if is_owner else "초대받은 채팅방",
+                emoji="👑" if is_owner else "💬",
+            )
+            for channel_id, name, is_owner in rooms[:25]
+        ]
+        super().__init__(placeholder="채팅방 선택", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id or not interaction.guild:
+            return await interaction.response.send_message("이 메뉴를 연 사용자만 조작할 수 있습니다.", ephemeral=True)
+        channel_id = int(self.values[0])
+        room = get_room(self.guild.id, channel_id)
+        if not room:
+            return await interaction.response.send_message("채팅방 정보를 찾을 수 없습니다. 패널을 다시 열어주세요.", ephemeral=True)
+        owner_id, room_name = room
+        channel = self.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("채팅방 채널이 삭제되었거나 접근할 수 없습니다.", ephemeral=True)
+        if owner_id == self.user_id:
+            await interaction.response.send_message(
+                f"**{room_name}** 채팅방 관리 패널입니다.\n채널: {channel.mention}",
+                view=OwnerPrivateRoomView(self.guild, channel_id, self.user_id),
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"**{room_name}** 채팅방입니다.\n채널: {channel.mention}",
+                view=ParticipantPrivateRoomView(self.guild, channel_id, self.user_id),
+                ephemeral=True,
+            )
+
+
+class MyPrivateRoomsView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int, rooms: list[tuple[int, str, bool]]):
+        super().__init__(timeout=300)
+        self.add_item(MyPrivateRoomsSelect(guild, user_id, rooms))
+
+
+class RenamePrivateRoomModal(discord.ui.Modal, title="채팅방 이름 변경"):
+    new_name = discord.ui.TextInput(label="새 채팅방 이름", min_length=1, max_length=90)
+
+    def __init__(self, guild_id: int, channel_id: int, owner_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("채팅방 소유자만 변경할 수 있습니다.", ephemeral=True)
+        room = get_room(self.guild_id, self.channel_id)
+        channel = interaction.guild.get_channel(self.channel_id)
+        if not room or room[0] != self.owner_id or not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("채팅방을 찾을 수 없거나 소유자가 아닙니다.", ephemeral=True)
+        new_name = str(self.new_name.value).strip()
+        try:
+            await channel.edit(name=room_channel_name(new_name), reason="채팅방 소유자 이름 변경")
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                conn.execute(
+                    "UPDATE private_rooms SET room_name=? WHERE guild_id=? AND channel_id=?",
+                    (new_name, self.guild_id, self.channel_id),
+                )
+                conn.commit()
+            await interaction.response.send_message(f"채팅방 이름을 **{new_name}**(으)로 변경했습니다.", ephemeral=True)
+        except discord.HTTPException:
+            await interaction.response.send_message("채팅방 이름을 변경하지 못했습니다.", ephemeral=True)
+
+
+class InvitePrivateRoomUserSelect(discord.ui.UserSelect):
+    def __init__(self, guild_id: int, channel_id: int, owner_id: int):
+        super().__init__(placeholder="초대할 서버 멤버 선택", min_values=1, max_values=1)
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("채팅방 소유자만 초대할 수 있습니다.", ephemeral=True)
+        room = get_room(self.guild_id, self.channel_id)
+        channel = interaction.guild.get_channel(self.channel_id)
+        target_user = self.values[0]
+        target = interaction.guild.get_member(target_user.id)
+        if not room or room[0] != self.owner_id or not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("채팅방을 찾을 수 없거나 소유자가 아닙니다.", ephemeral=True)
+        if target is None or target.bot or target.id == self.owner_id:
+            return await interaction.response.send_message("초대할 수 없는 사용자입니다. 서버의 일반 멤버를 선택해주세요.", ephemeral=True)
+        if target.id in get_room_members(self.guild_id, self.channel_id):
+            return await interaction.response.send_message("이미 참여 중인 사용자입니다.", ephemeral=True)
+        try:
+            await channel.set_permissions(target, view_channel=True, send_messages=True, read_message_history=True, reason="개인 채팅방 초대")
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO private_room_members(guild_id,channel_id,user_id,joined_at) VALUES(?,?,?,?)",
+                    (self.guild_id, self.channel_id, target.id, datetime.now(timezone.utc).timestamp()),
+                )
+                conn.commit()
+            await interaction.response.send_message(f"{target.mention} 님을 채팅방에 초대했습니다.", ephemeral=True)
+        except discord.HTTPException:
+            await interaction.response.send_message("사용자를 초대하지 못했습니다. 봇 권한을 확인해주세요.", ephemeral=True)
+
+
+class RoomMemberActionSelect(discord.ui.Select):
+    def __init__(self, guild: discord.Guild, channel_id: int, owner_id: int, action: str, member_ids: list[int]):
+        self.guild = guild
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+        self.action = action
+        options = []
+        for user_id in member_ids[:25]:
+            member = guild.get_member(user_id)
+            if member:
+                options.append(discord.SelectOption(label=str(member)[:100], value=str(user_id)))
+        if not options:
+            options = [discord.SelectOption(label="선택 가능한 참여자가 없습니다", value="none")]
+        super().__init__(
+            placeholder="대상 사용자 선택",
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=not any(option.value != "none" for option in options),
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("채팅방 소유자만 사용할 수 있습니다.", ephemeral=True)
+        room = get_room(self.guild.id, self.channel_id)
+        if not room or room[0] != self.owner_id:
+            return await interaction.response.send_message("채팅방 소유자가 아닙니다.", ephemeral=True)
+        if self.values[0] == "none":
+            return await interaction.response.send_message("선택할 수 있는 참여자가 없습니다.", ephemeral=True)
+        target_id = int(self.values[0])
+        if self.action == "kick":
+            if target_id not in get_room_members(self.guild.id, self.channel_id):
+                return await interaction.response.send_message("해당 사용자는 현재 참여자가 아닙니다.", ephemeral=True)
+            try:
+                await remove_room_member(self.guild, self.channel_id, target_id)
+                await interaction.response.send_message(f"<@{target_id}> 님을 채팅방에서 내보냈습니다.", ephemeral=True)
+            except discord.HTTPException:
+                await interaction.response.send_message("사용자를 내보내지 못했습니다.", ephemeral=True)
+        else:
+            if target_id not in get_room_members(self.guild.id, self.channel_id):
+                return await interaction.response.send_message("소유권은 현재 채팅방 참여자에게만 양도할 수 있습니다.", ephemeral=True)
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT channel_id FROM private_rooms WHERE guild_id=? AND owner_id=?",
+                    (self.guild.id, target_id),
+                ).fetchone()
+                if existing:
+                    conn.rollback()
+                    return await interaction.response.send_message("해당 사용자는 이미 다른 채팅방을 소유하고 있어 양도할 수 없습니다.", ephemeral=True)
+                changed = conn.execute(
+                    "UPDATE private_rooms SET owner_id=? WHERE guild_id=? AND channel_id=? AND owner_id=?",
+                    (target_id, self.guild.id, self.channel_id, self.owner_id),
+                ).rowcount
+                if not changed:
+                    conn.rollback()
+                    return await interaction.response.send_message("채팅방 소유권이 이미 변경되었습니다. 패널을 다시 열어주세요.", ephemeral=True)
+                conn.execute(
+                    "DELETE FROM private_room_members WHERE guild_id=? AND channel_id=? AND user_id=?",
+                    (self.guild.id, self.channel_id, target_id),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO private_room_members(guild_id,channel_id,user_id,joined_at) VALUES(?,?,?,?)",
+                    (self.guild.id, self.channel_id, self.owner_id, datetime.now(timezone.utc).timestamp()),
+                )
+                conn.commit()
+            channel = self.guild.get_channel(self.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.edit(topic=f"비공개 개인 채팅방 | 소유자 ID: {target_id}", reason="개인 채팅방 소유권 양도")
+                except discord.HTTPException:
+                    log.exception("채팅방 소유권 양도 후 채널 주제 갱신 실패: guild=%s channel=%s", self.guild.id, self.channel_id)
+            await interaction.response.send_message(
+                f"<@{target_id}> 님에게 채팅방 소유권을 양도했습니다. 이제 해당 사용자가 소유자이며, 기존 소유자는 일반 참여자가 되었습니다.",
+                ephemeral=True,
+            )
+
+
+class RoomMemberActionView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, channel_id: int, owner_id: int, action: str):
+        super().__init__(timeout=300)
+        members = get_room_members(guild.id, channel_id)
+        self.add_item(RoomMemberActionSelect(guild, channel_id, owner_id, action, members))
+
+
+class DeletePrivateRoomConfirmView(discord.ui.View):
+    def __init__(self, guild_id: int, channel_id: int, owner_id: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+
+    @discord.ui.button(label="삭제 확인", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("채팅방 소유자만 삭제할 수 있습니다.", ephemeral=True)
+        room = get_room(self.guild_id, self.channel_id)
+        if not room or room[0] != self.owner_id:
+            return await interaction.response.send_message("채팅방 소유자가 아닙니다.", ephemeral=True)
+        await delete_private_room(interaction.guild, self.channel_id, "채팅방 소유자 요청")
+        await interaction.response.edit_message(content="채팅방을 삭제했습니다.", view=None)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("이 메뉴를 연 사용자만 조작할 수 있습니다.", ephemeral=True)
+        await interaction.response.edit_message(content="삭제를 취소했습니다.", view=None)
+
+
+class OwnerPrivateRoomView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, channel_id: int, owner_id: int):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        room = get_room(self.guild.id, self.channel_id)
+        if interaction.user.id != self.owner_id or not room or room[0] != self.owner_id:
+            await interaction.response.send_message("이 채팅방의 현재 소유자만 관리할 수 있습니다.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="이름 변경", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RenamePrivateRoomModal(self.guild.id, self.channel_id, self.owner_id))
+
+    @discord.ui.button(label="사용자 초대", style=discord.ButtonStyle.success, emoji="➕")
+    async def invite(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=180)
+        view.add_item(InvitePrivateRoomUserSelect(self.guild.id, self.channel_id, self.owner_id))
+        await interaction.response.send_message("초대할 서버 멤버를 선택하세요.", view=view, ephemeral=True)
+
+    @discord.ui.button(label="사용자 추방", style=discord.ButtonStyle.secondary, emoji="➖")
+    async def kick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not get_room_members(self.guild.id, self.channel_id):
+            return await interaction.response.send_message("추방할 참여자가 없습니다.", ephemeral=True)
+        await interaction.response.send_message(
+            "내보낼 참여자를 선택하세요.",
+            view=RoomMemberActionView(self.guild, self.channel_id, self.owner_id, "kick"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="소유권 양도", style=discord.ButtonStyle.secondary, emoji="🔁")
+    async def transfer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not get_room_members(self.guild.id, self.channel_id):
+            return await interaction.response.send_message("소유권을 양도할 참여자가 없습니다. 먼저 사용자를 초대해주세요.", ephemeral=True)
+        await interaction.response.send_message(
+            "소유권을 양도할 참여자를 선택하세요. 이미 다른 채팅방을 소유한 사용자는 양도받을 수 없습니다.",
+            view=RoomMemberActionView(self.guild, self.channel_id, self.owner_id, "transfer"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="채팅방 삭제", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "정말 채팅방을 삭제할까요? 삭제하면 모든 참여자가 접근할 수 없게 됩니다.",
+            view=DeletePrivateRoomConfirmView(self.guild.id, self.channel_id, self.owner_id),
+            ephemeral=True,
+        )
+
+
+class ParticipantPrivateRoomView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, channel_id: int, user_id: int):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.channel_id = channel_id
+        self.user_id = user_id
+
+    @discord.ui.button(label="채팅방 나가기", style=discord.ButtonStyle.danger, emoji="🚪")
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("이 메뉴를 연 사용자만 조작할 수 있습니다.", ephemeral=True)
+        room = get_room(self.guild.id, self.channel_id)
+        if not room:
+            return await interaction.response.send_message("채팅방을 찾을 수 없습니다.", ephemeral=True)
+        if room[0] == self.user_id:
+            return await interaction.response.send_message("소유자는 먼저 소유권을 양도하거나 채팅방을 삭제해야 나갈 수 있습니다.", ephemeral=True)
+        if self.user_id not in get_room_members(self.guild.id, self.channel_id):
+            return await interaction.response.send_message("현재 참여 중인 채팅방이 아닙니다.", ephemeral=True)
+        try:
+            await remove_room_member(self.guild, self.channel_id, self.user_id)
+            await interaction.response.edit_message(content="채팅방에서 나왔습니다.", view=None)
+        except discord.HTTPException:
+            await interaction.response.send_message("채팅방에서 나가지 못했습니다. 잠시 후 다시 시도해주세요.", ephemeral=True)
+
+
+chat_group = app_commands.Group(name="채팅", description="비공개 개인 채팅방 패널을 설정합니다.")
+
+
+@chat_group.command(name="패널설정", description="개인 채팅방 생성 패널을 표시할 채널을 설정합니다.")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(채널="개인 채팅방 생성 패널을 게시할 텍스트 채널")
+async def chat_panel_setup(interaction: discord.Interaction, 채널: discord.TextChannel):
+    if not interaction.guild:
+        return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+    me = interaction.guild.me
+    perms = 채널.permissions_for(me) if me else None
+    if not perms or not perms.send_messages or not perms.embed_links:
+        return await interaction.response.send_message("봇에게 해당 채널의 메시지 전송 및 임베드 링크 권한이 필요합니다.", ephemeral=True)
+    set_chat_panel_settings(interaction.guild.id, 채널.id, 채널.category_id)
+    embed = discord.Embed(
+        title="개인 채팅방 시스템",
+        description="원하는 사람들과 함께 사용할 수 있는 비공개 채팅방을 만들어 보세요.\n\n• 채팅방은 생성자와 초대된 사용자만 볼 수 있습니다.\n• 한 사람당 소유할 수 있는 채팅방은 하나입니다.\n• 내 채팅방에서 참여 중인 방을 확인하고 관리할 수 있습니다.",
+        color=discord.Color.blurple(),
+    )
+    try:
+        await 채널.send(embed=embed, view=ChatPanelView())
+        await interaction.response.send_message(f"{채널.mention}에 개인 채팅방 패널을 게시했습니다.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.response.send_message("패널을 게시하지 못했습니다. 채널 권한을 확인해주세요.", ephemeral=True)
+
+
+@chat_group.command(name="패널해제", description="개인 채팅방 패널 설정을 해제합니다.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def chat_panel_clear(interaction: discord.Interaction):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("DELETE FROM chat_panel_settings WHERE guild_id=?", (interaction.guild_id,))
+        conn.commit()
+    await interaction.response.send_message("개인 채팅방 패널 설정을 해제했습니다. 기존 채팅방은 유지됩니다.", ephemeral=True)
+
+
+bot.tree.add_command(chat_group)
+
+
 # -------------------- 1. /유저정보 --------------------
 
 @bot.tree.command(name="유저정보", description="선택한 유저의 디스코드 및 서버 정보를 조회합니다.")
@@ -841,37 +1452,58 @@ async def ban_user(interaction: discord.Interaction, 유저: discord.Member, 사
 
 # -------------------- 6. /공지 --------------------
 
-@bot.tree.command(name="공지", description="서버 공지 채널에 @everyone과 함께 공지를 보냅니다.")
+@bot.tree.command(name="공지", description="서버의 모든 공지 채널에 @everyone과 함께 공지를 보냅니다.")
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(내용="공지로 보낼 메시지")
 async def announce(interaction: discord.Interaction, 내용: str):
     if not 내용.strip() or len(내용) > 1980:
         return await send_command_error(interaction, "공지 내용은 1~1980자 사이로 입력해주세요.")
     guild = interaction.guild
-    channel = guild.public_updates_channel or guild.system_channel
+    if guild is None:
+        return await send_command_error(interaction, "서버 안에서만 사용할 수 있습니다.")
 
-    if channel is None:
-        return await send_command_error(
-            interaction,
-            "공지 채널을 자동으로 찾지 못했습니다. 커뮤니티 서버의 공개 업데이트 채널 또는 시스템 채널을 설정해주세요.",
-        )
+    # 공지 채널 유형(news)인 채널은 모두 대상으로 한다.
+    announcement_channels = [
+        channel for channel in guild.text_channels
+        if channel.type == discord.ChannelType.news
+    ]
+    targets = announcement_channels
+    if not targets:
+        # 공지 유형 채널이 없을 때만 기존 공개 업데이트/시스템 채널을 보조 수단으로 사용한다.
+        fallback = []
+        for channel in (guild.public_updates_channel, guild.system_channel):
+            if isinstance(channel, discord.TextChannel) and channel not in fallback:
+                fallback.append(channel)
+        targets = fallback
 
+    if not targets:
+        return await send_command_error(interaction, "공지 채널 유형으로 설정된 채널을 찾지 못했고, 공개 업데이트 채널 및 시스템 채널도 설정되어 있지 않습니다.")
+
+    await interaction.response.defer(ephemeral=True)
+    sent = []
+    failed = []
     me = guild.me
-    perms = channel.permissions_for(me) if me else None
-    if not perms or not perms.send_messages:
-        return await send_command_error(interaction, "봇이 감지한 공지 채널에 메시지를 보낼 권한이 없습니다.")
+    for channel in targets:
+        perms = channel.permissions_for(me) if me else None
+        if not perms or not perms.send_messages or not perms.mention_everyone:
+            failed.append(f"{channel.mention} (전송 또는 @everyone 권한 없음)")
+            continue
+        try:
+            await channel.send(
+                f"@everyone\n{내용}",
+                allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
+            )
+            sent.append(channel)
+        except discord.HTTPException:
+            log.exception("공지 발송 실패: guild=%s channel=%s", guild.id, channel.id)
+            failed.append(f"{channel.mention} (전송 실패)")
 
-    try:
-        await channel.send(
-            f"@everyone\n{내용}",
-            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
-        )
-        await interaction.response.send_message(f"{channel.mention}에 공지를 발송했습니다.", ephemeral=True)
-    except discord.Forbidden:
-        await send_command_error(interaction, "공지 채널에 메시지를 보내거나 @everyone을 멘션할 권한이 없습니다.")
-    except discord.HTTPException as exc:
-        log.exception("공지 발송 실패")
-        await send_command_error(interaction, "공지를 보내지 못했습니다. 채널 권한을 확인한 뒤 다시 시도해 주세요.")
+    result = f"공지 발송 완료: **{len(sent)}개 채널**"
+    if sent:
+        result += "\n" + ", ".join(channel.mention for channel in sent)
+    if failed:
+        result += "\n\n전송하지 못한 채널:\n" + "\n".join(failed)
+    await interaction.followup.send(result, ephemeral=True)
 
 
 # -------------------- 7. 들낙 감지 --------------------
@@ -910,6 +1542,8 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_member_remove(member: discord.Member):
     guild = member.guild
+    # 채팅방 소유자가 서버를 나가거나 추방되면 소유 채팅방을 자동 삭제한다.
+    await cleanup_member_private_rooms(guild, member.id)
     if not leave_guard_enabled(guild.id):
         clear_member_join(guild.id, member.id)
         return
@@ -998,7 +1632,7 @@ async def on_message(message: discord.Message):
     if not isinstance(member, discord.Member):
         return
 
-    # 서버별 도배 감지가 꺼져 있으면 감지 및 자동 제재를 건너뜀
+    # 서버별 도배 감지가 꺼져 있으면 도배 감지만 건너뜀
     if not spam_guard_enabled(message.guild.id):
         await bot.process_commands(message)
         return
@@ -1094,7 +1728,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 @bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("DELETE FROM private_room_members WHERE guild_id=? AND channel_id=?", (channel.guild.id, channel.id))
+        conn.execute("DELETE FROM private_rooms WHERE guild_id=? AND channel_id=?", (channel.guild.id, channel.id))
+        conn.commit()
+
+
+@bot.event
 async def on_ready():
+    if not getattr(bot, "_private_chat_view_registered", False):
+        bot.add_view(ChatPanelView())
+        bot._private_chat_view_registered = True
     if not caution_expiry_loop.is_running():
         caution_expiry_loop.start()
     log.info("로그인 완료: %s (%s)", bot.user, bot.user.id if bot.user else "unknown")

@@ -49,6 +49,11 @@ SPAM_WINDOW_SECONDS = 180
 MAX_TIMEOUT_MINUTES = 28 * 24
 MAX_DELETE_COUNT = 1000
 
+# 경고·주의 정책
+WARNING_LIMIT = 5
+CAUTION_LIMIT = 2
+CAUTION_EXPIRY_SECONDS = 7 * 24 * 60 * 60
+
 
 # 들낙 감지 설정 및 영구 저장소
 # Railway에서는 Volume을 /data에 연결하고 BOT_DATABASE_PATH=/data/bot_data.sqlite3 설정 권장
@@ -214,6 +219,68 @@ def clear_member_join(guild_id: int, user_id: int) -> None:
             (guild_id, user_id),
         )
         conn.commit()
+
+
+# -------------------- 제재 기록 / 경고·주의 데이터 함수 --------------------
+
+def db_counts(guild_id: int, user_id: int) -> tuple[int, int]:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute(
+            "SELECT kind, COUNT(*) FROM sanctions WHERE guild_id=? AND user_id=? AND active=1 GROUP BY kind",
+            (guild_id, user_id),
+        ).fetchall()
+    counts = {kind: count for kind, count in rows}
+    return counts.get("warning", 0), counts.get("caution", 0)
+
+
+def add_history(guild_id: int, user_id: int, action: str, reason: str, actor_id: int | None, automatic: bool = False) -> None:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute(
+            "INSERT INTO moderation_history (guild_id,user_id,action,reason,actor_id,created_at,automatic) VALUES (?,?,?,?,?,?,?)",
+            (guild_id, user_id, action, (reason or "")[:1000], actor_id, datetime.now(timezone.utc).timestamp(), int(automatic)),
+        )
+        conn.commit()
+
+
+def add_sanction(guild_id: int, user_id: int, kind: str, actor_id: int | None, reason: str) -> None:
+    if kind not in {"warning", "caution"}:
+        raise ValueError(f"지원하지 않는 제재 유형: {kind}")
+    now = datetime.now(timezone.utc).timestamp()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute(
+            "INSERT INTO sanctions (guild_id,user_id,kind,active,created_at,actor_id,reason) VALUES (?,?,?,1,?,?,?)",
+            (guild_id, user_id, kind, now, actor_id, (reason or "")[:1000]),
+        )
+        conn.commit()
+    add_history(guild_id, user_id, "경고 부여" if kind == "warning" else "주의 부여", reason, actor_id)
+
+
+def remove_sanction(guild_id: int, user_id: int, kind: str, actor_id: int | None, reason: str) -> bool:
+    now = datetime.now(timezone.utc).timestamp()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            "SELECT id FROM sanctions WHERE guild_id=? AND user_id=? AND kind=? AND active=1 ORDER BY created_at ASC, id ASC LIMIT 1",
+            (guild_id, user_id, kind),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE sanctions SET active=0, removed_at=? WHERE id=?", (now, row[0]))
+        conn.commit()
+    add_history(guild_id, user_id, "경고 차감" if kind == "warning" else "주의 차감", reason, actor_id)
+    return True
+
+
+async def get_actor_label(guild: discord.Guild, actor_id: int | None) -> str:
+    if actor_id is None:
+        return "자동 시스템"
+    member = guild.get_member(actor_id)
+    if member:
+        return f"{member} ({member.id})"
+    try:
+        user = await bot.fetch_user(actor_id)
+        return f"{user} ({user.id})"
+    except discord.HTTPException:
+        return f"알 수 없는 관리자 ({actor_id})"
 
 
 # -------------------- 공개 제재 알림 채널 / 개인 채팅방 저장소 --------------------
